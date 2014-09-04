@@ -22,15 +22,15 @@ func PrintUsage() {
 	fmt.Println(`
 Usage: dwnldr [options] <urls>...
   Examples:
-    dwnldr http://de.edis.at/100MB.test
+    dwnldr http://de.edis.at/100MB.test http://at.edis.at/100MB.test
     dwnldr -s 1M http://de.edis.at/100MB.test
   Options:
     -h      Show this screen.
     -v      Show version.
-    -o      Set output filename.
-    -d      Set output root directory.
+    -o=<s>  Set output filename.
+    -d=<s>  Set output root directory.
     -p      Set parallel download mode.
-    -s=<b>  Speed in Bytes/s [default: 0 (no limit)].
+    -s=<b>  Set speed limit in Bytes/s [default: 0 (no limit)].
   `)
 }
 
@@ -66,6 +66,31 @@ func mapContains(fm map[string]string, fs string) bool {
 	return false
 }
 
+func strNtimes(bstr string, times int) (ret string) {
+	for i := 0; i < times; i++ {
+		ret += bstr
+	}
+	return
+}
+
+func strPadding(instr string, padlen int) string {
+	pdiff := padlen - len(instr)
+	if pdiff <= 0 {
+		return instr
+	}
+	return strNtimes(" ", pdiff) + instr
+}
+
+func strLimitAndPad(instr string, maxlen int) string {
+	if maxlen < 3 {
+		return instr
+	}
+	if len(instr) <= maxlen {
+		return strPadding(instr, maxlen)
+	}
+	return instr[:maxlen-3] + "..."
+}
+
 func genName(fu map[string]string, fn string) string {
 	baseFn := fn
 	for i := 1; mapContains(fu, fn); i++ {
@@ -73,6 +98,23 @@ func genName(fu map[string]string, fn string) string {
 		fmt.Println(fn)
 	}
 	return fn
+}
+
+func getBar(maxlen int, per float64) string {
+	curser := ">"
+	barchar := "="
+	emptychar := " "
+	bar := ""
+	maxlen -= 1
+	pos := int(float64(maxlen) * per)
+	if pos > 0 {
+		bar += strNtimes(barchar, pos) + curser
+	} else {
+		bar += emptychar
+	}
+
+	bar += strNtimes(emptychar, maxlen-pos)
+	return bar
 }
 
 func writeLine(l int, txt string) {
@@ -84,12 +126,16 @@ func downloadFromUrl(url string, out string, l int, done chan int) string {
 	_, ifn := path.Split(out)
 	ldstr := ""
 	cb := func(st curl.IoCopyStat) error {
-		writeLine(l, fmt.Sprintf(" %s [%s]: %s %s", s.Next(), ifn, st.Perstr, st.Speedstr))
+		writeLine(l, fmt.Sprintf("%s [%s] %s | %s | %s", s.Next(), getBar(28, st.Per), strPadding(st.Perstr, 6), strPadding(st.Speedstr, 10), strLimitAndPad(ifn, 15)))
 		ldstr = st.Durstr
 		return nil
 	}
-	curl.File(url, out, cb, "maxspeed=", maxSpeed, "cbinterval=", 0.1)
-	writeLine(l, fmt.Sprintf("   [%s] %s: done, duration: %s", ifn, ldstr))
+	err, _ := curl.File(url, out, cb, "maxspeed=", maxSpeed, "cbinterval=", 0.1)
+	if err != nil {
+		writeLine(l, fmt.Sprintf("E %s: %s", strLimitAndPad(url, 20), err))
+	} else {
+		writeLine(l, fmt.Sprintf("D [%s] [%s]: %s", getBar(28, 1), ldstr, strLimitAndPad(ifn, 15)))
+	}
 	done <- l
 	return out
 }
@@ -107,6 +153,7 @@ func downloadAllFiles(fu map[string]string, prl bool) {
 	dch := make(chan int)
 	offset := 1
 	count := 0
+	lenmstrar := len(mstrar)
 	if prl {
 		for i, v := range mstrar {
 			go downloadFromUrl(v[0], v[1], i+offset, dch)
@@ -114,17 +161,19 @@ func downloadAllFiles(fu map[string]string, prl bool) {
 	} else {
 		go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch)
 	}
+	writeLine(lenmstrar+offset, fmt.Sprintf("Downloading %d File(s)...", lenmstrar))
 dfl:
 	for {
 		select {
-		case ln := <-dch:
-			writeLine(ln, "Done: "+strconv.Itoa(count+1)+"\n")
+		case <-dch:
 			count++
-			if count >= len(mstrar) {
+			if count >= lenmstrar {
+				writeLine(lenmstrar+offset, fmt.Sprintf("Downloaded %d File(s).\n", lenmstrar))
 				break dfl
 			} else if !prl {
 				go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch)
 			}
+			writeLine(lenmstrar+offset, fmt.Sprintf("Downloading %d/%d File(s)...\n", count, lenmstrar))
 		}
 	}
 }
@@ -172,6 +221,11 @@ func main() {
 			pfn = *defOutputFile
 		}
 		fileurls[u] = path.Join(*defOutputDir, genName(fileurls, pfn))
+	}
+	if len(fileurls) < 1 {
+		fmt.Println("URL(s) missing.")
+		flag.Usage()
+		return
 	}
 	terminal.Stdout.Clear()
 	downloadAllFiles(fileurls, *parallel)
