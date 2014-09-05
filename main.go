@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/christophwitzko/go-curl"
+	"github.com/olekukonko/ts"
 	"github.com/visionmedia/go-spin"
 	"github.com/wsxiaoys/terminal"
 	"math"
@@ -16,7 +17,20 @@ import (
 
 const Version string = "dwnldr v0.0.1"
 
-var maxSpeed int64
+var (
+	maxSpeed        int64
+	tHeight, tWidth int
+)
+
+type DownloadStat struct {
+	stat     *curl.IoCopyStat
+	sp       *spin.Spinner
+	url      string
+	out      string
+	shortout string
+	id       int
+	err      error
+}
 
 func PrintUsage() {
 	fmt.Println(`
@@ -66,19 +80,12 @@ func mapContains(fm map[string]string, fs string) bool {
 	return false
 }
 
-func strNtimes(bstr string, times int) (ret string) {
-	for i := 0; i < times; i++ {
-		ret += bstr
-	}
-	return
-}
-
 func strPadding(instr string, padlen int) string {
 	pdiff := padlen - len(instr)
 	if pdiff <= 0 {
 		return instr
 	}
-	return strNtimes(" ", pdiff) + instr
+	return strings.Repeat(" ", pdiff) + instr
 }
 
 func strLimitAndPad(instr string, maxlen int) string {
@@ -88,7 +95,7 @@ func strLimitAndPad(instr string, maxlen int) string {
 	if len(instr) <= maxlen {
 		return strPadding(instr, maxlen)
 	}
-	return instr[:maxlen-3] + "..."
+	return instr[:maxlen-1] + "…"
 }
 
 func genName(fu map[string]string, fn string) string {
@@ -108,12 +115,12 @@ func getBar(maxlen int, per float64) string {
 	maxlen -= 1
 	pos := int(float64(maxlen) * per)
 	if pos > 0 {
-		bar += strNtimes(barchar, pos) + curser
+		bar += strings.Repeat(barchar, pos) + curser
 	} else {
 		bar += emptychar
 	}
 
-	bar += strNtimes(emptychar, maxlen-pos)
+	bar += strings.Repeat(emptychar, maxlen-pos)
 	return bar
 }
 
@@ -121,20 +128,24 @@ func writeLine(l int, txt string) {
 	terminal.Stdout.Move(l, 0).ClearLine().Print(txt)
 }
 
-func downloadFromUrl(url string, out string, l int, done chan int) string {
+func averageFloat64(vals map[int]float64) float64 {
+	sum := float64(0)
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+func downloadFromUrl(url string, out string, l int, done chan int, stat chan DownloadStat) string {
 	s := spin.New()
 	_, ifn := path.Split(out)
-	ldstr := ""
 	cb := func(st curl.IoCopyStat) error {
-		writeLine(l, fmt.Sprintf("%s [%s] %s | %s | %s", s.Next(), getBar(28, st.Per), strPadding(st.Perstr, 6), strPadding(st.Speedstr, 10), strLimitAndPad(ifn, 15)))
-		ldstr = st.Durstr
+		stat <- DownloadStat{&st, s, url, out, ifn, l, nil}
 		return nil
 	}
-	err, _ := curl.File(url, out, cb, "maxspeed=", maxSpeed, "cbinterval=", 0.1)
+	err, _ := curl.File(url, out, cb, "maxspeed=", maxSpeed, "cbinterval=", 0.2)
 	if err != nil {
-		writeLine(l, fmt.Sprintf("E %s: %s", strLimitAndPad(url, 20), err))
-	} else {
-		writeLine(l, fmt.Sprintf("D [%s] [%s]: %s", getBar(28, 1), ldstr, strLimitAndPad(ifn, 15)))
+		stat <- DownloadStat{&curl.IoCopyStat{}, s, url, out, ifn, l, err}
 	}
 	done <- l
 	return out
@@ -151,29 +162,45 @@ func downloadAllFiles(fu map[string]string, prl bool) {
 		i++
 	}
 	dch := make(chan int)
+	statch := make(chan DownloadStat)
 	offset := 1
 	count := 0
 	lenmstrar := len(mstrar)
+	gsp := spin.New()
+	gsp.Set(spin.Spin5)
+	statprog := make(map[int]float64, lenmstrar)
 	if prl {
 		for i, v := range mstrar {
-			go downloadFromUrl(v[0], v[1], i+offset, dch)
+			go downloadFromUrl(v[0], v[1], i+offset, dch, statch)
 		}
 	} else {
-		go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch)
+		go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch, statch)
 	}
-	writeLine(lenmstrar+offset, fmt.Sprintf("Downloading %d File(s)...", lenmstrar))
 dfl:
 	for {
 		select {
 		case <-dch:
 			count++
 			if count >= lenmstrar {
-				writeLine(lenmstrar+offset, fmt.Sprintf("Downloaded %d File(s).\n", lenmstrar))
+				writeLine(lenmstrar+offset, fmt.Sprintf("G [%s] 100.0%% | %d/%d File(s)\n", getBar(28, 1), count, lenmstrar))
 				break dfl
 			} else if !prl {
-				go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch)
+				go downloadFromUrl(mstrar[count][0], mstrar[count][1], count+offset, dch, statch)
 			}
-			writeLine(lenmstrar+offset, fmt.Sprintf("Downloading %d/%d File(s)...\n", count, lenmstrar))
+		case st := <-statch:
+			if st.err != nil {
+				statprog[st.id] = float64(1)
+				writeLine(st.id, fmt.Sprintf("E %s: %s", strLimitAndPad(st.url, 20), st.err))
+				continue dfl
+			}
+			statprog[st.id] = st.stat.Per
+			avg := averageFloat64(statprog)
+			writeLine(lenmstrar+offset, fmt.Sprintf("%s [%s] %s | %d/%d File(s)", gsp.Next(), getBar(28, avg), strPadding(curl.PrettyPer(avg), 6), count, lenmstrar))
+			if st.stat.Per >= 1.0 {
+				writeLine(st.id, fmt.Sprintf("D [%s] [%s]: %s", getBar(28, 1), strPadding(st.stat.Durstr, 6), strLimitAndPad(st.shortout, 15)))
+				continue dfl
+			}
+			writeLine(st.id, fmt.Sprintf("%s [%s] %s | %s | %s", st.sp.Next(), getBar(28, st.stat.Per), strPadding(st.stat.Perstr, 6), strPadding(st.stat.Speedstr, 10), strLimitAndPad(st.shortout, 15)))
 		}
 	}
 }
@@ -189,6 +216,15 @@ func main() {
 	defOutputDir := flag.String("d", "./", "root")
 
 	flag.Parse()
+
+	tSize, err := ts.GetSize()
+	if err != nil {
+		fmt.Println("Cannot get terminal width:", err)
+		return
+	}
+	tWidth = tSize.Col()
+	tHeight = tSize.Row()
+
 	if *help {
 		flag.Usage()
 		return
@@ -213,9 +249,8 @@ func main() {
 			return
 		}
 		pfn := "index"
-		if strings.Contains(pu.Path, "/") && len(pu.Path) > 1 {
-			sss := strings.Split(pu.Path, "/")
-			pfn = sss[len(sss)-1]
+		if _, psp := path.Split(pu.Path); len(psp) > 1 {
+			pfn = psp
 		}
 		if len(*defOutputFile) > 0 {
 			pfn = *defOutputFile
